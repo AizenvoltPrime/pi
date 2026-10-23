@@ -113,6 +113,26 @@ describe("loadEntriesFromFile", () => {
 		expect(readFileSync(file, "utf8")).toBe(`${content}\n`);
 	});
 
+	it("parses a line that spans many read chunks", () => {
+		const file = join(tempDir, "long-line.jsonl");
+		const header = '{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}';
+		const long = JSON.stringify({
+			type: "message",
+			id: "long",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "é".repeat(3 * 1024 * 1024), timestamp: 1 },
+		});
+		const last =
+			'{"type":"message","id":"1","parentId":"long","timestamp":"2025-01-01T00:00:02Z","message":{"role":"user","content":"hi","timestamp":2}}';
+		writeFileSync(file, `${header}\n${long}\n${last}`);
+
+		const entries = loadEntriesFromFile(file);
+
+		expect(entries.map((entry) => (entry as { id: string }).id)).toEqual(["abc", "long", "1"]);
+		expect(readFileSync(file, "utf8")).toBe(`${header}\n${long}\n${last}\n`);
+	});
+
 	it("does not modify an unterminated non-session file", () => {
 		const file = join(tempDir, "invalid.jsonl");
 		const content = '{"type":"message","id":"1"}';

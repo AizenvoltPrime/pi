@@ -623,49 +623,69 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 	}
 }
 
+/**
+ * Parses session file bytes into entries, one chunk at a time.
+ * Each chunk is scanned once, so a line spanning many chunks costs linear time.
+ */
+function createSessionEntryReader() {
+	const decoder = new StringDecoder("utf8");
+	const entries: FileEntry[] = [];
+	let linePieces: string[] = [];
+
+	const takeLines = (text: string): void => {
+		let lineStart = 0;
+		let newlineIndex = text.indexOf("\n");
+		while (newlineIndex !== -1) {
+			linePieces.push(text.slice(lineStart, newlineIndex));
+			const entry = parseSessionEntryLine(linePieces.join(""));
+			if (entry) entries.push(entry);
+			linePieces = [];
+			lineStart = newlineIndex + 1;
+			newlineIndex = text.indexOf("\n", lineStart);
+		}
+		if (lineStart < text.length) linePieces.push(text.slice(lineStart));
+	};
+
+	return {
+		write(bytes: Buffer): void {
+			takeLines(decoder.write(bytes));
+		},
+		/** Returns no entries for a file that does not start with a session header. */
+		end(): { entries: FileEntry[]; needsTrailingNewline: boolean } {
+			takeLines(decoder.end());
+			const unterminatedLine = linePieces.join("");
+			const finalEntry = parseSessionEntryLine(unterminatedLine);
+			if (finalEntry) entries.push(finalEntry);
+
+			const header = entries[0];
+			if (header?.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
+				return { entries: [], needsTrailingNewline: false };
+			}
+			return { entries, needsTrailingNewline: unterminatedLine.length > 0 };
+		},
+	};
+}
+
 /** Exported for testing */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
-	const entries: FileEntry[] = [];
-	let pending = "";
+	const reader = createSessionEntryReader();
 	const fd = openSync(resolvedFilePath, "r");
 	try {
-		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-
 		while (true) {
 			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
 			if (bytesRead === 0) break;
-
-			pending += decoder.write(buffer.subarray(0, bytesRead));
-			let lineStart = 0;
-			let newlineIndex = pending.indexOf("\n", lineStart);
-			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
-				lineStart = newlineIndex + 1;
-				newlineIndex = pending.indexOf("\n", lineStart);
-			}
-			pending = pending.slice(lineStart);
+			reader.write(buffer.subarray(0, bytesRead));
 		}
-
-		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
 	} finally {
 		closeSync(fd);
 	}
 
-	// Validate session header before repairing the file.
-	if (entries.length === 0) return entries;
-	const header = entries[0];
-	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
-		return [];
-	}
-
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	const { entries, needsTrailingNewline } = reader.end();
+	if (needsTrailingNewline) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
