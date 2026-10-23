@@ -14,7 +14,12 @@ import {
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	findMostRecentSession,
+	loadEntriesFromFile,
+	loadEntriesFromFileAsync,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 import { assistantMsg, readSessionFileRoles, userMsg } from "../utilities.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
@@ -206,6 +211,189 @@ describe("loadEntriesFromFile", () => {
 		expect(sessionManager.getSessionId()).toBe("abc");
 		expect(sessionManager.getEntries()).toHaveLength(1);
 		expect(sessionManager.buildSessionContext().messages).toEqual([{ role: "user", content: "hi", timestamp: 1 }]);
+	});
+});
+
+describe("loadEntriesFromFileAsync and SessionManager.openAsync", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "session-async-test-"));
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const header = '{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/stored"}';
+	const message =
+		'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}';
+
+	it.each([
+		["empty", ""],
+		["no header", '{"type":"message","id":"1"}\n'],
+		["malformed", "not json\n"],
+		["valid", `${header}\n${message}\n`],
+		["mixed", `${header}\nnot valid json\n${message}\n`],
+		["leading blank lines", `\n  \n${header}\n`],
+		["crlf", `${header}\r\n${message}\r\n`],
+		[
+			"multi-byte across a chunk boundary",
+			`${header}\n${"x".repeat(1024 * 1024 - header.length - 2)}é\n${message}\n`,
+		],
+	])("matches loadEntriesFromFile for %s", async (_name, content) => {
+		const syncFile = join(tempDir, "sync.jsonl");
+		const asyncFile = join(tempDir, "async.jsonl");
+		writeFileSync(syncFile, content);
+		writeFileSync(asyncFile, content);
+
+		expect(await loadEntriesFromFileAsync(asyncFile)).toEqual(loadEntriesFromFile(syncFile));
+	});
+
+	it("returns an empty array for a missing file", async () => {
+		expect(await loadEntriesFromFileAsync(join(tempDir, "missing.jsonl"))).toEqual([]);
+	});
+
+	it("adds a newline after an unterminated record, but not to a non-session file", async () => {
+		const session = join(tempDir, "unterminated.jsonl");
+		const other = join(tempDir, "other.jsonl");
+		writeFileSync(session, `${header}\n${message}`);
+		writeFileSync(other, '{"type":"message","id":"1"}');
+
+		expect(await loadEntriesFromFileAsync(session)).toHaveLength(2);
+		expect(await loadEntriesFromFileAsync(other)).toEqual([]);
+		expect(readFileSync(session, "utf8")).toBe(`${header}\n${message}\n`);
+		expect(readFileSync(other, "utf8")).toBe('{"type":"message","id":"1"}');
+	});
+
+	it("rejects with the abort reason", async () => {
+		const file = join(tempDir, "valid.jsonl");
+		writeFileSync(file, `${header}\n${message}\n`);
+		const controller = new AbortController();
+		controller.abort(new Error("stop"));
+
+		await expect(SessionManager.openAsync(file, tempDir, undefined, { signal: controller.signal })).rejects.toThrow(
+			"stop",
+		);
+	});
+
+	function writeMultiChunkSession(file: string): void {
+		const text = "x".repeat(64 * 1024);
+		const lines = [header];
+		for (let i = 0; i < 64; i++) {
+			lines.push(
+				JSON.stringify({
+					type: "message",
+					id: `m${i}`,
+					parentId: i === 0 ? null : `m${i - 1}`,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content: text, timestamp: i },
+				}),
+			);
+		}
+		writeFileSync(file, `${lines.join("\n")}\n`);
+	}
+
+	it("stops a read in progress", async () => {
+		const file = join(tempDir, "multi-chunk.jsonl");
+		writeMultiChunkSession(file);
+		const controller = new AbortController();
+
+		const opening = SessionManager.openAsync(file, tempDir, undefined, { signal: controller.signal });
+		controller.abort(new Error("stop"));
+
+		await expect(opening).rejects.toThrow("stop");
+	});
+
+	it("lets the event loop run between chunks", async () => {
+		const file = join(tempDir, "multi-chunk.jsonl");
+		writeMultiChunkSession(file);
+		let turns = 0;
+		let counting = true;
+		const countTurn = () => {
+			turns++;
+			if (counting) setImmediate(countTurn);
+		};
+		setImmediate(countTurn);
+
+		const session = await SessionManager.openAsync(file, tempDir);
+		counting = false;
+
+		expect(session.getEntries()).toHaveLength(64);
+		expect(turns).toBeGreaterThanOrEqual(3);
+	});
+
+	it("matches loadEntriesFromFile on a line that spans many chunks", async () => {
+		const file = join(tempDir, "long-line.jsonl");
+		const long = JSON.stringify({
+			type: "message",
+			id: "long",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "é".repeat(3 * 1024 * 1024), timestamp: 1 },
+		});
+		writeFileSync(file, `${header}\n${long}\n${message}`);
+
+		const entries = await loadEntriesFromFileAsync(file);
+
+		expect(entries.map((entry) => (entry as { id: string }).id)).toEqual(["abc", "long", "1"]);
+		expect(loadEntriesFromFile(file)).toEqual(entries);
+	});
+
+	it("opens a session like open()", async () => {
+		const file = join(tempDir, "valid.jsonl");
+		writeFileSync(file, `${header}\n${message}\n`);
+
+		const opened = SessionManager.open(file, tempDir);
+		const openedAsync = await SessionManager.openAsync(file, tempDir);
+
+		expect(openedAsync.getSessionId()).toBe("abc");
+		expect(openedAsync.getCwd()).toBe(opened.getCwd());
+		expect(openedAsync.getEntries()).toEqual(opened.getEntries());
+		expect(openedAsync.getLeafId()).toBe(opened.getLeafId());
+		expect(openedAsync.getSessionFile()).toBe(opened.getSessionFile());
+	});
+
+	it("uses the cwd override and the parent folder as the session directory", async () => {
+		const file = join(tempDir, "valid.jsonl");
+		writeFileSync(file, `${header}\n`);
+		const override = join(tempDir, "override");
+
+		const session = await SessionManager.openAsync(file, undefined, override);
+
+		expect(session.getCwd()).toBe(override);
+		expect(session.getSessionDir()).toBe(SessionManager.open(file).getSessionDir());
+	});
+
+	it("reads the header beyond open()'s discovery scan limit", async () => {
+		const file = join(tempDir, "large-prefix.jsonl");
+		writeFileSync(file, `${"x".repeat(HEADER_SCAN_LIMIT_BYTES + 1)}\n${header}\n`);
+
+		const session = await SessionManager.openAsync(file, tempDir);
+
+		expect(session.getSessionId()).toBe("abc");
+		expect(session.getCwd()).toBe(SessionManager.open(file, tempDir).getCwd());
+	});
+
+	it("starts a new session at a missing path and initializes an empty file", async () => {
+		const missing = join(tempDir, "missing.jsonl");
+		const empty = join(tempDir, "empty.jsonl");
+		writeFileSync(empty, "");
+
+		const fromMissing = await SessionManager.openAsync(missing, tempDir);
+		const fromEmpty = await SessionManager.openAsync(empty, tempDir);
+
+		expect(fromMissing.getSessionFile()).toBe(missing);
+		expect(existsSync(missing)).toBe(false);
+		expect(fromEmpty.getHeader()?.id).toBe(fromEmpty.getSessionId());
+		expect(readFileSync(empty, "utf8")).toContain('"type":"session"');
+	});
+
+	it("refuses a non-empty file that is not a session", async () => {
+		const file = join(tempDir, "invalid.jsonl");
+		writeFileSync(file, '{"type":"message","id":"1"}\n');
+
+		await expect(SessionManager.openAsync(file, tempDir)).rejects.toThrow("is not a valid");
 	});
 });
 

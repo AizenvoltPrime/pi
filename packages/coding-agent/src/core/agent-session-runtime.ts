@@ -207,7 +207,7 @@ export class AgentSessionRuntime {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+		const sessionManager = await SessionManager.openAsync(sessionPath, undefined, options?.cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
 		this.apply(
@@ -312,7 +312,7 @@ export class AgentSessionRuntime {
 			if (!existsSync(currentSessionFile)) {
 				throw new Error("This session has not been saved yet. Send a message before cloning or forking it.");
 			}
-			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+			const sessionManager = await SessionManager.openAsync(currentSessionFile, sessionDir);
 			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
 			if (!forkedSessionPath) {
 				throw new Error("Failed to create forked session");
@@ -386,7 +386,7 @@ export class AgentSessionRuntime {
 			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
 		}
 
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+		const sessionManager = await SessionManager.openAsync(destinationPath, sessionDir, cwdOverride);
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
 		this.apply(

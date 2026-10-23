@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -244,6 +244,35 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(readFileSync(storedPath, "utf8")).toBe(storedSession);
 		expect(runtime.session.sessionFile).not.toBe(storedPath);
 		expect(readFileSync(runtime.session.sessionFile!, "utf8")).toContain('"id":"imported"');
+	});
+
+	it("reads replacement sessions with SessionManager.openAsync", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+		const firstSessionFile = runtime.session.sessionFile!;
+		const leafId = runtime.session.sessionManager.getLeafId()!;
+		const importPath = join(tempDir, "import", "imported.jsonl");
+		mkdirSync(join(tempDir, "import"), { recursive: true });
+		writeFileSync(
+			importPath,
+			`${JSON.stringify({ type: "session", version: 3, id: "imported", timestamp: new Date().toISOString(), cwd: tempDir })}\n`,
+		);
+		const open = vi.spyOn(SessionManager, "open").mockImplementation(() => {
+			throw new Error("SessionManager.open blocks the event loop");
+		});
+		const openAsync = vi.spyOn(SessionManager, "openAsync");
+
+		try {
+			await runtime.fork(leafId, { position: "at" });
+			await runtime.switchSession(firstSessionFile);
+			await runtime.importFromJsonl(importPath);
+
+			expect(openAsync).toHaveBeenCalledTimes(3);
+			expect(runtime.session.sessionManager.getSessionId()).toBe("imported");
+		} finally {
+			open.mockRestore();
+			openAsync.mockRestore();
+		}
 	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {

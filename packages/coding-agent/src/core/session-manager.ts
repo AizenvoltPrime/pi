@@ -25,7 +25,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, stat } from "fs/promises";
+import { appendFile, type FileHandle, open as openFile, readdir, stat } from "fs/promises";
 import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
@@ -686,6 +686,40 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 
 	const { entries, needsTrailingNewline } = reader.end();
 	if (needsTrailingNewline) appendFileSync(resolvedFilePath, "\n");
+	return entries;
+}
+
+/**
+ * Same result and repair as loadEntriesFromFile(), read in chunks that yield to the event loop.
+ * Exported for testing.
+ */
+export async function loadEntriesFromFileAsync(filePath: string, signal?: AbortSignal): Promise<FileEntry[]> {
+	const resolvedFilePath = normalizePath(filePath);
+	signal?.throwIfAborted();
+
+	let handle: FileHandle;
+	try {
+		handle = await openFile(resolvedFilePath, "r");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+
+	const reader = createSessionEntryReader();
+	try {
+		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+		while (true) {
+			signal?.throwIfAborted();
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			reader.write(buffer.subarray(0, bytesRead));
+		}
+	} finally {
+		await handle.close();
+	}
+
+	const { entries, needsTrailingNewline } = reader.end();
+	if (needsTrailingNewline) await appendFile(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -1803,6 +1837,26 @@ export class SessionManager {
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
 		return new SessionManager(cwd, dir, resolvedPath, true, undefined, preloadedFileEntries);
+	}
+
+	/**
+	 * Same as open(), but reads the file without blocking the event loop.
+	 * @param options.signal Stops the read between chunks; the promise rejects with the abort reason.
+	 */
+	static async openAsync(
+		path: string,
+		sessionDir?: string,
+		cwdOverride?: string,
+		options?: { signal?: AbortSignal },
+	): Promise<SessionManager> {
+		const resolvedPath = resolvePath(path);
+		const entries = await loadEntriesFromFileAsync(resolvedPath, options?.signal);
+		const firstEntry = entries[0];
+		const header = firstEntry?.type === "session" ? firstEntry : null;
+		const cwd = cwdOverride ?? (header ? getSessionHeaderCwd(header) : undefined) ?? process.cwd();
+		const dir = sessionDir ? normalizePath(sessionDir) : resolve(resolvedPath, "..");
+		// No entries means a missing, empty or invalid file; the constructor re-checks it as open() does.
+		return new SessionManager(cwd, dir, resolvedPath, true, undefined, entries.length > 0 ? entries : undefined);
 	}
 
 	/**
