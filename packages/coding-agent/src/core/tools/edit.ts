@@ -1,15 +1,8 @@
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
-import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import {
-	applyEditsToNormalizedContent,
-	applyReplacementsToOriginal,
-	type Edit,
-	generateEditDiff,
-	normalizeToLF,
-} from "./edit-diff.ts";
+import { computeEditResult, type Edit, generateEditDiff } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { type EditRenderState, editRenderers } from "./renderers/edit.ts";
@@ -182,22 +175,11 @@ export function createEditToolDefinition(
 				const rawContent = buffer.toString("utf-8");
 				throwIfAborted();
 
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = splitBom(rawContent);
-				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
-					normalizedContent,
-					edits,
-					path,
-				);
+				const { finalContent, baseContent, newContent, replacements } = computeEditResult(rawContent, edits, path);
 				// Diff before writing, so diff computation cannot fail after the write.
 				const editDiff = generateEditDiff(path, baseContent, newContent, replacements);
 				throwIfAborted();
 
-				// Splice into the original text, so untouched lines keep their line endings. Without any CR
-				// the original is the normalized text, and the normalized result is already final.
-				const finalContent =
-					bom + (content === normalizedContent ? newContent : applyReplacementsToOriginal(content, replacements));
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 

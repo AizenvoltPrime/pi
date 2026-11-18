@@ -405,6 +405,28 @@ export function applyEditsToNormalizedContent(
 	return { baseContent, newContent, replacements };
 }
 
+export interface EditResult extends AppliedEditsResult {
+	/** The file's new text: its BOM and the line endings of untouched lines kept */
+	finalContent: string;
+}
+
+/**
+ * Apply one or more replacements to a file's text as the edit tool does, without reading, writing or diffing.
+ * Throws the edit tool's errors where it refuses the edits. `baseContent` and `newContent` are the texts the
+ * edit tool diffs: BOM removed, line endings LF.
+ */
+export function computeEditResult(rawContent: string, edits: Edit[], path: string): EditResult {
+	// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+	const { bom, text: content } = splitBom(rawContent);
+	const normalizedContent = normalizeToLF(content);
+	const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+	// Splice into the original text, so untouched lines keep their line endings. Without any CR
+	// the original is the normalized text, and the normalized result is already final.
+	const finalContent =
+		bom + (content === normalizedContent ? newContent : applyReplacementsToOriginal(content, replacements));
+	return { finalContent, baseContent, newContent, replacements };
+}
+
 /** Generate a standard unified patch. */
 export function generateUnifiedPatch(path: string, oldContent: string, newContent: string, contextLines = 4): string {
 	return Diff.createTwoFilesPatch(path, path, oldContent, newContent, undefined, undefined, {
